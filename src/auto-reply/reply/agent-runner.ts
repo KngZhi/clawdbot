@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { runClaudeCliAgent } from "../../agents/claude-cli-runner.js";
 import { lookupContextTokens } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import {
@@ -170,54 +171,59 @@ export async function runReplyAgent(params: {
       registerAgentRunContext(runId, { sessionKey });
     }
     let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+    const useClaudeCli = followupRun.run.provider === "claude-cli";
     try {
-      runResult = await runEmbeddedPiAgent({
-        sessionId: followupRun.run.sessionId,
-        sessionKey,
-        surface: sessionCtx.Surface?.trim().toLowerCase() || undefined,
-        sessionFile: followupRun.run.sessionFile,
-        workspaceDir: followupRun.run.workspaceDir,
-        config: followupRun.run.config,
-        skillsSnapshot: followupRun.run.skillsSnapshot,
-        prompt: commandBody,
-        extraSystemPrompt: followupRun.run.extraSystemPrompt,
-        ownerNumbers: followupRun.run.ownerNumbers,
-        enforceFinalTag: followupRun.run.enforceFinalTag,
-        provider: followupRun.run.provider,
-        model: followupRun.run.model,
-        thinkLevel: followupRun.run.thinkLevel,
-        verboseLevel: followupRun.run.verboseLevel,
-        bashElevated: followupRun.run.bashElevated,
-        timeoutMs: followupRun.run.timeoutMs,
-        runId,
-        blockReplyBreak: resolvedBlockStreamingBreak,
-        blockReplyChunking,
-        onPartialReply: opts?.onPartialReply
-          ? async (payload) => {
-              let text = payload.text;
-              if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
-                const stripped = stripHeartbeatToken(text, { mode: "message" });
-                if (stripped.didStrip && !didLogHeartbeatStrip) {
-                  didLogHeartbeatStrip = true;
-                  logVerbose("Stripped stray HEARTBEAT_OK token from reply");
-                }
-                if (
-                  stripped.shouldSkip &&
-                  (payload.mediaUrls?.length ?? 0) === 0
-                ) {
-                  return;
-                }
-                text = stripped.text;
-              }
-              await typing.startTypingOnText(text);
-              await opts.onPartialReply?.({
-                text,
-                mediaUrls: payload.mediaUrls,
-              });
-            }
-          : undefined,
-        onBlockReply:
-          blockStreamingEnabled && opts?.onBlockReply
+      if (useClaudeCli) {
+        const claudeResult = await runClaudeCliAgent({
+          sessionId: followupRun.run.sessionId,
+          sessionKey,
+          workspaceDir: followupRun.run.workspaceDir,
+          config: followupRun.run.config,
+          prompt: commandBody,
+          model: followupRun.run.model,
+          timeoutMs: followupRun.run.timeoutMs,
+          runId,
+          appendSystemPrompt: followupRun.run.extraSystemPrompt,
+          skipPermissions:
+            followupRun.run.config?.agent?.claudeCli?.skipPermissions,
+        });
+        runResult = {
+          payloads: claudeResult.payloads,
+          meta: {
+            durationMs: claudeResult.meta.durationMs,
+            agentMeta: {
+              sessionId:
+                claudeResult.meta.sessionId ?? followupRun.run.sessionId,
+              provider: "claude-cli",
+              model: claudeResult.meta.model ?? followupRun.run.model,
+              usage: claudeResult.meta.usage,
+            },
+            aborted: claudeResult.meta.aborted,
+          },
+        };
+      } else {
+        runResult = await runEmbeddedPiAgent({
+          sessionId: followupRun.run.sessionId,
+          sessionKey,
+          surface: sessionCtx.Surface?.trim().toLowerCase() || undefined,
+          sessionFile: followupRun.run.sessionFile,
+          workspaceDir: followupRun.run.workspaceDir,
+          config: followupRun.run.config,
+          skillsSnapshot: followupRun.run.skillsSnapshot,
+          prompt: commandBody,
+          extraSystemPrompt: followupRun.run.extraSystemPrompt,
+          ownerNumbers: followupRun.run.ownerNumbers,
+          enforceFinalTag: followupRun.run.enforceFinalTag,
+          provider: followupRun.run.provider,
+          model: followupRun.run.model,
+          thinkLevel: followupRun.run.thinkLevel,
+          verboseLevel: followupRun.run.verboseLevel,
+          bashElevated: followupRun.run.bashElevated,
+          timeoutMs: followupRun.run.timeoutMs,
+          runId,
+          blockReplyBreak: resolvedBlockStreamingBreak,
+          blockReplyChunking,
+          onPartialReply: opts?.onPartialReply
             ? async (payload) => {
                 let text = payload.text;
                 if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
@@ -228,73 +234,109 @@ export async function runReplyAgent(params: {
                     didLogHeartbeatStrip = true;
                     logVerbose("Stripped stray HEARTBEAT_OK token from reply");
                   }
-                  const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;
-                  if (stripped.shouldSkip && !hasMedia) return;
+                  if (
+                    stripped.shouldSkip &&
+                    (payload.mediaUrls?.length ?? 0) === 0
+                  ) {
+                    return;
+                  }
                   text = stripped.text;
                 }
-                const tagResult = extractReplyToTag(
+                await typing.startTypingOnText(text);
+                await opts.onPartialReply?.({
                   text,
-                  sessionCtx.MessageSid,
-                );
-                const cleaned = tagResult.cleaned || undefined;
-                const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;
-                if (!cleaned && !hasMedia) return;
-                if (cleaned?.trim() === SILENT_REPLY_TOKEN && !hasMedia) return;
-                const blockPayload: ReplyPayload = {
-                  text: cleaned,
                   mediaUrls: payload.mediaUrls,
-                  mediaUrl: payload.mediaUrls?.[0],
-                  replyToId: tagResult.replyToId,
-                };
-                const payloadKey = buildPayloadKey(blockPayload);
-                if (
-                  streamedPayloadKeys.has(payloadKey) ||
-                  pendingStreamedPayloadKeys.has(payloadKey)
-                ) {
-                  return;
-                }
-                pendingStreamedPayloadKeys.add(payloadKey);
-                const task = (async () => {
-                  await typing.startTypingOnText(cleaned);
-                  await opts.onBlockReply?.(blockPayload);
-                })()
-                  .then(() => {
-                    streamedPayloadKeys.add(payloadKey);
-                    didStreamBlockReply = true;
-                  })
-                  .catch((err) => {
-                    logVerbose(`block reply delivery failed: ${String(err)}`);
-                  })
-                  .finally(() => {
-                    pendingStreamedPayloadKeys.delete(payloadKey);
-                  });
-                pendingBlockTasks.add(task);
-                void task.finally(() => pendingBlockTasks.delete(task));
+                });
               }
             : undefined,
-        shouldEmitToolResult,
-        onToolResult: opts?.onToolResult
-          ? async (payload) => {
-              let text = payload.text;
-              if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
-                const stripped = stripHeartbeatToken(text, { mode: "message" });
-                if (stripped.didStrip && !didLogHeartbeatStrip) {
-                  didLogHeartbeatStrip = true;
-                  logVerbose("Stripped stray HEARTBEAT_OK token from reply");
+          onBlockReply:
+            blockStreamingEnabled && opts?.onBlockReply
+              ? async (payload) => {
+                  let text = payload.text;
+                  if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                    const stripped = stripHeartbeatToken(text, {
+                      mode: "message",
+                    });
+                    if (stripped.didStrip && !didLogHeartbeatStrip) {
+                      didLogHeartbeatStrip = true;
+                      logVerbose(
+                        "Stripped stray HEARTBEAT_OK token from reply",
+                      );
+                    }
+                    const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;
+                    if (stripped.shouldSkip && !hasMedia) return;
+                    text = stripped.text;
+                  }
+                  const tagResult = extractReplyToTag(
+                    text,
+                    sessionCtx.MessageSid,
+                  );
+                  const cleaned = tagResult.cleaned || undefined;
+                  const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;
+                  if (!cleaned && !hasMedia) return;
+                  if (cleaned?.trim() === SILENT_REPLY_TOKEN && !hasMedia)
+                    return;
+                  const blockPayload: ReplyPayload = {
+                    text: cleaned,
+                    mediaUrls: payload.mediaUrls,
+                    mediaUrl: payload.mediaUrls?.[0],
+                    replyToId: tagResult.replyToId,
+                  };
+                  const payloadKey = buildPayloadKey(blockPayload);
+                  if (
+                    streamedPayloadKeys.has(payloadKey) ||
+                    pendingStreamedPayloadKeys.has(payloadKey)
+                  ) {
+                    return;
+                  }
+                  pendingStreamedPayloadKeys.add(payloadKey);
+                  const task = (async () => {
+                    await typing.startTypingOnText(cleaned);
+                    await opts.onBlockReply?.(blockPayload);
+                  })()
+                    .then(() => {
+                      streamedPayloadKeys.add(payloadKey);
+                      didStreamBlockReply = true;
+                    })
+                    .catch((err) => {
+                      logVerbose(`block reply delivery failed: ${String(err)}`);
+                    })
+                    .finally(() => {
+                      pendingStreamedPayloadKeys.delete(payloadKey);
+                    });
+                  pendingBlockTasks.add(task);
+                  void task.finally(() => pendingBlockTasks.delete(task));
                 }
-                if (
-                  stripped.shouldSkip &&
-                  (payload.mediaUrls?.length ?? 0) === 0
-                ) {
-                  return;
+              : undefined,
+          shouldEmitToolResult,
+          onToolResult: opts?.onToolResult
+            ? async (payload) => {
+                let text = payload.text;
+                if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                  const stripped = stripHeartbeatToken(text, {
+                    mode: "message",
+                  });
+                  if (stripped.didStrip && !didLogHeartbeatStrip) {
+                    didLogHeartbeatStrip = true;
+                    logVerbose("Stripped stray HEARTBEAT_OK token from reply");
+                  }
+                  if (
+                    stripped.shouldSkip &&
+                    (payload.mediaUrls?.length ?? 0) === 0
+                  ) {
+                    return;
+                  }
+                  text = stripped.text;
                 }
-                text = stripped.text;
+                await typing.startTypingOnText(text);
+                await opts.onToolResult?.({
+                  text,
+                  mediaUrls: payload.mediaUrls,
+                });
               }
-              await typing.startTypingOnText(text);
-              await opts.onToolResult?.({ text, mediaUrls: payload.mediaUrls });
-            }
-          : undefined,
-      });
+            : undefined,
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const isContextOverflow =

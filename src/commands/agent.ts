@@ -12,6 +12,7 @@ import {
   resolveConfiguredModelRef,
   resolveThinkingDefault,
 } from "../agents/model-selection.js";
+import { runClaudeCliAgent } from "../agents/claude-cli-runner.js";
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
 import {
@@ -372,32 +373,71 @@ export async function agentCommand(
         if (!raw) return undefined;
         return raw === "imsg" ? "imessage" : raw;
       })();
-    result = await runEmbeddedPiAgent({
-      sessionId,
-      sessionKey,
-      surface,
-      sessionFile,
-      workspaceDir,
-      config: cfg,
-      skillsSnapshot,
-      prompt: body,
-      provider,
-      model,
-      thinkLevel: resolvedThinkLevel,
-      verboseLevel: resolvedVerboseLevel,
-      timeoutMs,
-      runId,
-      lane: opts.lane,
-      abortSignal: opts.abortSignal,
-      extraSystemPrompt: opts.extraSystemPrompt,
-      onAgentEvent: (evt) => {
-        emitAgentEvent({
-          runId,
-          stream: evt.stream,
-          data: evt.data,
-        });
-      },
-    });
+
+    const useClaudeCli = provider === "claude-cli";
+
+    if (useClaudeCli) {
+      const claudeResult = await runClaudeCliAgent({
+        sessionId,
+        sessionKey,
+        workspaceDir,
+        config: cfg,
+        prompt: body,
+        model,
+        timeoutMs,
+        runId,
+        abortSignal: opts.abortSignal,
+        appendSystemPrompt: opts.extraSystemPrompt,
+        skipPermissions: cfg?.agent?.claudeCli?.skipPermissions,
+        onAgentEvent: (evt) => {
+          emitAgentEvent({
+            runId,
+            stream: evt.stream,
+            data: evt.data,
+          });
+        },
+      });
+      result = {
+        payloads: claudeResult.payloads,
+        meta: {
+          durationMs: claudeResult.meta.durationMs,
+          agentMeta: {
+            sessionId: claudeResult.meta.sessionId ?? sessionId,
+            provider: "claude-cli",
+            model: claudeResult.meta.model ?? model,
+            usage: claudeResult.meta.usage,
+          },
+          aborted: claudeResult.meta.aborted,
+        },
+      };
+    } else {
+      result = await runEmbeddedPiAgent({
+        sessionId,
+        sessionKey,
+        surface,
+        sessionFile,
+        workspaceDir,
+        config: cfg,
+        skillsSnapshot,
+        prompt: body,
+        provider,
+        model,
+        thinkLevel: resolvedThinkLevel,
+        verboseLevel: resolvedVerboseLevel,
+        timeoutMs,
+        runId,
+        lane: opts.lane,
+        abortSignal: opts.abortSignal,
+        extraSystemPrompt: opts.extraSystemPrompt,
+        onAgentEvent: (evt) => {
+          emitAgentEvent({
+            runId,
+            stream: evt.stream,
+            data: evt.data,
+          });
+        },
+      });
+    }
     emitAgentEvent({
       runId,
       stream: "job",

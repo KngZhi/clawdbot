@@ -810,6 +810,11 @@ export type ClawdbotConfig = {
         maxAgeDays?: number;
       };
     };
+    claudeCli?: {
+      skipPermissions?: boolean;
+      allowedTools?: string[];
+      disallowedTools?: string[];
+    };
   };
   routing?: RoutingConfig;
   messages?: MessagesConfig;
